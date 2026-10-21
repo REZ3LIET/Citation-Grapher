@@ -9,7 +9,7 @@ graph is the discovery mechanism and exploration interface; bibliometric
 analysis and reconstruction of a complete historical citation network are not
 the primary objectives.
 
-The application accepts at least two seed papers, one or more guiding topics,
+The application accepts at least one seed paper, one or more guiding topics,
 and an inclusive publication-year range. It prioritizes discovering previously
 unknown papers, showing relationships among retained publications, supporting
 topic-assisted exploration, and exporting reproducible datasets for later
@@ -25,7 +25,7 @@ terminate the whole run.
 ### Fixed policies
 
 - Citation directions: backward, forward, or both; default both.
-- Expansion depth: 1–3 hops, default 2.
+- Expansion depth: 1–3 hops, default 1.
 - The year range is a hard inclusion constraint at every expansion step.
 - Guiding topics annotate papers; they never prune discovery or the canonical
   graph.
@@ -36,6 +36,11 @@ terminate the whole run.
   available for exploration and export.
 - Discovery state is checkpointed to disk and a paused or interrupted run can be
   resumed after restarting the application.
+- Candidate collection is bounded to protect keyless providers. Default budgets
+  are three pages and 600 raw candidates per parent paper/direction, 10,000
+  pending candidates per BFS depth, and 1,500 provider requests per run. These
+  operational values are configurable, but a reached budget is never silent: it
+  marks the affected frontier and run as retrieval-incomplete.
 
 ## 2. Proposed architecture
 
@@ -171,11 +176,11 @@ ambiguous delimiter conventions.
 
 ### Step 1: Validate configuration
 
-- Require at least two non-empty seed inputs and at least one topic.
+- Require at least one non-empty seed input and at least one topic.
 - Require integer years with minimum no greater than maximum.
 - Accept depth 1–3 and a supported citation direction.
 - Normalize and deduplicate identical seed strings before resolution, while
-  still requiring at least two distinct resolved seeds.
+  requiring at least one resolved seed.
 
 ### Step 2: Resolve seeds
 
@@ -190,8 +195,8 @@ candidates but cannot independently discover forward citations.
 
 Every unresolved seed produces a user-visible error. Seeds outside the range are
 reported as exclusions rather than silently included. Discovery starts when at
-least two distinct seeds both resolve successfully and satisfy the year
-constraint; other unresolved or excluded seed inputs remain in run metadata.
+least one seed resolves successfully and satisfies the year constraint; other
+unresolved or excluded seed inputs remain in run metadata.
 
 ### Step 3: Collect and schedule BFS frontiers
 
@@ -201,11 +206,18 @@ or retrieval for part of depth `d` has been explicitly recorded as incomplete.
 
 For each depth and originating seed frontier:
 
-1. Fetch configured backward references and/or forward citations. OpenAlex
+1. Fetch configured backward references and/or forward citations. When both are
+   selected, complete bounded forward lookups across the level before beginning
+   bibliography-heavy backward resolution. OpenAlex
    reference IDs supply backward candidates; filtered citing-work queries supply
    forward candidates. arXiv metadata and locally parsed public PDFs provide
    metadata and backward-reference fallbacks only.
-2. Persist every provider page, cursor, failure, and pagination restriction.
+2. Retry throttling and transient provider failures with bounded exponential
+   backoff, charging every attempt to the durable request budget. Persist every
+   provider page, cursor, failure, and pagination restriction.
+   Stop collection at the configured per-query page/candidate budget, per-depth
+   pending-candidate budget, or run-wide request budget. Persist the next cursor
+   where available and classify the stop as `application_collection_budget`.
 3. Apply the inclusive year filter in provider queries where possible, then
    verify locally. Papers with missing years are excluded and logged.
 4. Resolve canonical identifiers and merge forward and backward candidates.
@@ -225,8 +237,9 @@ For each depth and originating seed frontier:
 
 Sorting occurs over candidates actually retrieved for the sealed depth
 frontier. If a provider returns only a partial frontier, blocks pagination, or
-fails after retries, the scheduler never implies global ordering: it records
-that ordering and traversal completeness apply only to retrieved candidates.
+fails after retries—or an application collection budget is reached—the
+scheduler never implies global ordering: it records that ordering and traversal
+completeness apply only to retrieved candidates.
 Transient failures use bounded exponential backoff and `Retry-After`; provider
 adapters use bounded concurrency and descriptive identification without
 requiring contact details or credentials.
@@ -293,6 +306,8 @@ heuristic indicators, not calibrated probabilities.
 - exclusions by year, missing year, insufficient identity, and other metadata;
 - API failures, retry exhaustion, pagination restrictions, and incomplete
   retrieval by provider, paper, and direction;
+- configured collection budgets, consumption, each budget-hit location, saved
+  continuation cursor when available, and estimated/known uncollected counts;
 - count and provenance summary of unprocessed candidates at stop time;
 - edge-completion coverage by success, partial, failed, or unsupported status;
 - topic annotation coverage, unclassified count, model, and scoring settings;
@@ -310,6 +325,7 @@ Initial endpoint contract:
 | Method | Path | Responsibility |
 | --- | --- | --- |
 | `POST` | `/api/runs` | Validate input, create run, begin resolution/discovery |
+| `POST` | `/api/topic-search` | Run a bounded Boolean paper search for seed review |
 | `GET` | `/api/runs/{id}` | Return status, progress, warnings, and errors |
 | `POST` | `/api/runs/{id}/continue` | Resume a run paused at 500 papers |
 | `POST` | `/api/runs/{id}/stop` | Stop discovery and finalize retained data |
@@ -329,6 +345,8 @@ names are validated to prevent arbitrary filesystem access.
 ### Study Configuration
 
 - Repeatable seed input supporting pasted identifiers/URLs and PDF upload.
+- Alternate topic-search mode with Boolean query syntax, explicit result limits,
+  candidate review, and selection of one or more papers as graph seeds.
 - Repeatable topic entry.
 - Inclusive minimum/maximum year, direction, and depth controls.
 - Inline validation plus this prominent limitation notice:
@@ -362,6 +380,20 @@ names are validated to prevent arbitrary filesystem access.
 - A clear badge identifies stopped or hard-limited partial runs.
 - Provider-limited and retrieval-incomplete runs are also visibly distinguished
   from fully processed attempted traversals.
+
+### Discovered Papers
+
+- Provide a dedicated searchable and sortable publication list linked
+  bidirectionally with the graph explorer.
+- Emphasize publication year, title, authors, seed/discovered status, discovery
+  depth, assigned topics, and topic-similarity scores.
+- Default to newest publication year first, with controls for topic relevance,
+  year, and discovery depth. The list uses the same non-destructive filter state
+  as the graph.
+- Selecting a list row opens that paper's details and focuses its node in the
+  graph; selecting a graph node highlights and scrolls to its list row.
+- Provide a list-first usable view when a graph is too dense or a paper lacks
+  enough relationships to be visually prominent.
 
 ### Export
 
@@ -403,6 +435,7 @@ exercise all limit and provider-incompleteness behaviors.
 
 - Load generated or uploaded canonical CSVs.
 - Render the Cytoscape graph, details, directionality, search, and basic filters.
+- Build the linked Discovered Papers list with year- and topic-focused sorting.
 - Ensure filters leave source records unchanged.
 
 Exit criterion: exported fixtures reconstruct the expected graph without any
@@ -457,6 +490,8 @@ not depend on live network availability.
 - Transient provider failure and rate-limit retries.
 - Restricted pagination, partial frontier ordering, PDF backward-only fallback,
   and graceful fallback failure.
+- Per-query, per-depth, and per-run collection-budget exhaustion with explicit
+  coverage metadata and restart-safe saved cursors.
 - Referential integrity across all exports.
 
 ### Frontend tests
@@ -466,6 +501,7 @@ not depend on live network availability.
 - Keyless-provider restriction and incomplete-retrieval disclosures.
 - Filter combinations and non-destructive behavior.
 - Search by title, author, DOI, and provider ID.
+- Linked selection and shared filter state between Discovered Papers and graph.
 - Partial-run labeling and artifact downloads.
 
 ### End-to-end tests
@@ -532,6 +568,10 @@ not depend on live network availability.
   probability.
 - Expanded the paper detail view and progress reporting to emphasize discovered
   publications and their provenance.
+- Added bounded candidate collection at per-query, per-depth, and per-run levels,
+  with explicit budget-consumption and incomplete-coverage reporting.
+- Added a dedicated newest-first Discovered Papers list with shared filters and
+  bidirectional selection linking it to the citation graph.
 
 ## 12. Known limitations and unresolved technical risks
 
@@ -541,6 +581,9 @@ not depend on live network availability.
 - Keyless endpoints may change rate limits, schemas, pagination policies, or
   access without notice. The application can report and degrade around these
   conditions but cannot eliminate them.
+- Conservative candidate budgets intentionally trade breadth for predictable
+  keyless-provider usage. Budget-capped runs are retrieval-incomplete even when
+  no provider error occurred.
 - Sealing a frontier before deterministic sorting may require retrieving and
   storing many more candidates than the 1,000-paper retention limit. Disk use,
   request cost, and latency need measurement with realistic fixtures.

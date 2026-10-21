@@ -1,0 +1,29 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      CITATION_GRAPHER_DATABASE_URL: sqlite:////data/citation_grapher.db
+      CITATION_GRAPHER_RUNS_DIR: /data/runs
+      CITATION_GRAPHER_GROBID_BASE_URL: http://grobid:8070
+    volumes:
+      - citation-data:/data
+    ports:
+      - "8000:8000"
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on: [backend]
+    ports:
+      - "5173:80"
+  grobid:
+    image: lfoppiano/grobid:0.8.1
+    profiles: [pdf]
+    ports:
+      - "8070:8070"
+
+volumes:
+  citation-data:
+

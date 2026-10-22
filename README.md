@@ -88,5 +88,6 @@ budgets are recorded in `run_metadata.json` and shown in the interface.
 
 ## Project documents
 
+- [Comprehensive documentation](DOCUMENTATION.md)
 - [Implementation plan](IMPLEMENTATION_PLAN.md)
 - [Deferred work](TODO.md)

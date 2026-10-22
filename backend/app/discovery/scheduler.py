@@ -29,7 +29,10 @@ class Candidate:
     def to_checkpoint(self) -> dict:
         evidence = {
             key: self.work.raw[key]
-            for key in ("bibliography_evidence", "seed_source", "provider", "anthology_id")
+            for key in (
+                "bibliography_evidence", "seed_source", "provider", "anthology_id",
+                "resolution_status",
+            )
             if key in self.work.raw
         }
         return {

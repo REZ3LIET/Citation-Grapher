@@ -67,6 +67,19 @@ class RunExpand(BaseModel):
     target_level: int = Field(ge=2, le=3)
 
 
+class SubsetExportRequest(BaseModel):
+    paper_ids: list[str] = Field(min_length=1, max_length=1000)
+    filter_expression: str | None = Field(default=None, max_length=2000)
+    filters: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_paper_ids(self):
+        self.paper_ids = list(dict.fromkeys(item.strip() for item in self.paper_ids if item.strip()))
+        if not self.paper_ids:
+            raise ValueError("At least one paper is required for a subset export")
+        return self
+
+
 class RunSummary(BaseModel):
     id: str
     phase: str

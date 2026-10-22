@@ -35,6 +35,16 @@ export const api = {
     body.append('file', file)
     return request<{ identifier: string; title: string | null; year: number | null }>('/api/seed-pdfs/identify', { method: 'POST', body })
   },
+  exportSubset: async (id: string, body: unknown) => {
+    const response = await fetch(`/api/runs/${id}/exports/subset`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({ detail: response.statusText }))
+      throw new Error(detail.detail || 'Subset export failed')
+    }
+    return response.blob()
+  },
   exportUrl: (id: string, name: string) => `/api/runs/${id}/exports/${name}`,
 }
 

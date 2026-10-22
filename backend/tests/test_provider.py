@@ -1,7 +1,9 @@
 import httpx
 import pytest
 
-from app.providers.openalex import OpenAlexClient, ProviderRateLimited, parse_work
+from app.providers.openalex import (
+    OpenAlexClient, ProviderRateLimited, _ArxivBibliographyParser, parse_work,
+)
 
 
 def payload(identifier="W1", year=2024, cited=4):
@@ -44,6 +46,66 @@ def test_forward_collection_stops_at_page_budget_and_reports_cursor():
     assert used == 2
     assert report["capped"] is True
     assert report["next_cursor"] == "cursor-2"
+
+
+def test_forward_falls_back_to_semantic_scholar_when_openalex_is_empty():
+    def handler(request):
+        if request.url.host == "api.test":
+            return httpx.Response(200, json={
+                "meta": {"count": 0, "next_cursor": None}, "results": [],
+            })
+        assert request.url.host == "api.semanticscholar.org"
+        assert "/paper/DOI:10.1%2Fexample/citations" in str(request.url)
+        return httpx.Response(200, json={
+            "offset": 0,
+            "data": [{"citingPaper": {
+                "paperId": "s2-citing", "externalIds": {"ArXiv": "2605.12345"},
+                "title": "A verified citing paper", "authors": [{"name": "Ada Author"}],
+                "year": 2026, "venue": "arXiv", "abstract": "Citation evidence",
+                "url": "https://www.semanticscholar.org/paper/s2-citing", "citationCount": 0,
+            }}],
+        })
+
+    client = OpenAlexClient("https://api.test", transport=httpx.MockTransport(handler))
+    used = 0
+    def consume():
+        nonlocal used
+        used += 1
+    try:
+        works, report = client.forward(parse_work(payload()), 2024, 2026, 1, 5, consume)
+    finally:
+        client.close()
+
+    assert [work.canonical_id for work in works] == ["doi:10.48550/arxiv.2605.12345"]
+    assert works[0].raw["provider"] == "semantic_scholar"
+    assert report["provider"] == "semantic_scholar"
+    assert report["fallback_from"] == "openalex"
+    assert [attempt["provider"] for attempt in report["provider_attempts"]] == [
+        "openalex", "semantic_scholar",
+    ]
+    assert used == 2
+
+
+def test_forward_reports_keyless_semantic_scholar_throttling():
+    def handler(request):
+        if request.url.host == "api.test":
+            return httpx.Response(200, json={
+                "meta": {"count": 0, "next_cursor": None}, "results": [],
+            })
+        return httpx.Response(429, json={"message": "Too Many Requests"})
+
+    client = OpenAlexClient(
+        "https://api.test", transport=httpx.MockTransport(handler), max_retries=0,
+    )
+    try:
+        works, report = client.forward(parse_work(payload()), 2024, 2026, 1, 5, lambda: None)
+    finally:
+        client.close()
+
+    assert works == []
+    assert report["failed"] is True
+    assert report["provider"] == "semantic_scholar"
+    assert report["reason"] == "provider_rate_limited"
 
 
 def test_provider_retries_throttled_requests_and_counts_each_attempt():
@@ -241,4 +303,147 @@ def test_backward_uses_arxiv_bibliography_when_openalex_references_are_empty():
     assert report["unresolved"] == 0
     assert report["source"] == "arxiv_html_bibliography"
     assert used == 2
+
+
+def test_bibliography_parser_extracts_unlinked_title_and_real_first_author():
+    parser = _ArxivBibliographyParser()
+    parser.feed('''
+      <li id="bib.bib2" class="ltx_bibitem">
+        <span class="ltx_tag_bibitem">Cao and Yang (2015)</span>
+        <span class="ltx_bibblock">Yinzhi Cao and Junfeng Yang. 2015.</span>
+        <span class="ltx_bibblock">Towards making systems forget with machine unlearning.</span>
+        <span class="ltx_bibblock">In <em>IEEE symposium on security and privacy</em>.</span>
+      </li>
+    ''')
+
+    [reference] = parser.references
+    assert reference["title"] == "Towards making systems forget with machine unlearning"
+    assert reference["first_author"] == "Yinzhi Cao"
+    assert reference["position"] == 1
+
+
+def test_backward_retains_all_five_and_uses_native_arxiv_fallback(monkeypatch):
+    html = '''
+    <section id="bib"><ul>
+      <li id="bib.bib1"><span class="ltx_tag_bibitem">Bao et al. (2025)</span>
+        <span class="ltx_bibblock">Guangsheng Bao et al. 2025.</span>
+        <span class="ltx_bibblock"><a href="https://aclanthology.org/2025.coling-main.524/">How likely do LLMs with CoT mimic human reasoning?</a></span></li>
+      <li id="bib.bib2"><span class="ltx_tag_bibitem">Cao and Yang (2015)</span>
+        <span class="ltx_bibblock">Yinzhi Cao and Junfeng Yang. 2015.</span>
+        <span class="ltx_bibblock">Towards making systems forget with machine unlearning.</span></li>
+      <li id="bib.bib3"><span class="ltx_tag_bibitem">Chen et al. (2024)</span>
+        <span class="ltx_bibblock">Kongyang Chen et al. 2024.</span>
+        <span class="ltx_bibblock"><a href="https://arxiv.org/abs/2404.16841">Machine unlearning in large language models</a>.</span></li>
+      <li id="bib.bib4"><span class="ltx_tag_bibitem">DeepSeek-AI (2024)</span>
+        <span class="ltx_bibblock">DeepSeek-AI. 2024.</span>
+        <span class="ltx_bibblock"><a href="https://arxiv.org/abs/2412.19437">Deepseek-v3 technical report</a>.</span></li>
+      <li id="bib.bib5"><span class="ltx_tag_bibitem">DeepSeek-AI (2025)</span>
+        <span class="ltx_bibblock">DeepSeek-AI. 2025.</span>
+        <span class="ltx_bibblock"><a href="https://arxiv.org/abs/2501.12948">Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning</a>.</span></li>
+    </ul></section>
+    '''
+
+    def cited(identifier, doi, title, year, author):
+        item = payload(identifier, year, 1)
+        item.update({
+            "doi": f"https://doi.org/{doi}", "title": title,
+            "publication_year": year,
+            "authorships": [{"author": {"display_name": author}}],
+        })
+        return item
+
+    def handler(request):
+        if request.url.host == "arxiv.org":
+            return httpx.Response(200, text=html)
+        if request.url.host == "aclanthology.org":
+            return httpx.Response(200, text=(
+                '<meta name="citation_title" content="How likely do LLMs with CoT mimic human reasoning?">'
+                '<meta name="citation_author" content="Guangsheng Bao">'
+                '<meta name="citation_publication_date" content="2025">'
+            ))
+        if "filter" in request.url.params:
+            return httpx.Response(200, json={"results": [
+                cited("W3", "10.48550/arxiv.2404.16841", "Machine Unlearning in Large Language Models", 2024, "Kongyang Chen"),
+                cited("W4", "10.48550/arxiv.2412.19437", "DeepSeek-V3 Technical Report", 2024, "DeepSeek-AI"),
+            ]})
+        if "search.exact" in request.url.params:
+            return httpx.Response(200, json={"results": [
+                cited("W2", "10.1109/sp.2015.35", "Towards Making Systems Forget with Machine Unlearning", 2015, "Yinzhi Cao"),
+            ]})
+        # ACL-to-OpenAlex enrichment may fail; the authoritative ACL record is
+        # still a resolved identity and the question mark must not abort BFS.
+        return httpx.Response(400, json={"error": "invalid search punctuation"})
+
+    monkeypatch.setattr("app.providers.arxiv.resolve_arxiv", lambda value, consume: (
+        consume() or {
+            "arxiv_id": value, "title": "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning",
+            "authors": ["DeepSeek-AI"], "year": 2025, "abstract": "Reasoning model",
+            "url": f"https://arxiv.org/abs/{value}",
+        }
+    ))
+    client = OpenAlexClient("https://api.test", transport=httpx.MockTransport(handler), max_retries=0)
+    seed = parse_work(payload("WSEED", 2026, 0))
+    seed.canonical_id = "doi:10.48550/arxiv.2604.15847"
+    seed.doi = "10.48550/arxiv.2604.15847"
+    seed.arxiv_id = "2604.15847"
+    seed.referenced_works = []
+    used = 0
+    def consume():
+        nonlocal used
+        used += 1
+    try:
+        works, report = client.backward(seed, 5, consume)
+    finally:
+        client.close()
+
+    assert len(works) == 5
+    assert {item.canonical_id for item in works} == {
+        "acl:2025.coling-main.524", "doi:10.1109/sp.2015.35",
+        "doi:10.48550/arxiv.2404.16841", "doi:10.48550/arxiv.2412.19437",
+        "doi:10.48550/arxiv.2501.12948",
+    }
+    assert report["retrieved"] == 5
+    assert report["unresolved"] == 0
+    assert report["provisional"] == 0
+    assert report["failed"] is False
+
+
+def test_backward_lookup_failure_isolated_and_retained_as_provisional():
+    html = '''
+      <li id="bib.bib1"><span class="ltx_tag_bibitem">One (2024)</span>
+        <span class="ltx_bibblock">Ada One. 2024.</span><span class="ltx_bibblock">Bad query?</span></li>
+      <li id="bib.bib2"><span class="ltx_tag_bibitem">Two (2023)</span>
+        <span class="ltx_bibblock">Bob Two. 2023.</span><span class="ltx_bibblock">Resolvable paper</span></li>
+    '''
+    search_calls = 0
+    def handler(request):
+        nonlocal search_calls
+        if request.url.host == "arxiv.org":
+            return httpx.Response(200, text=html)
+        search_calls += 1
+        if search_calls == 1:
+            return httpx.Response(400, json={"error": "bad query"})
+        item = payload("WOK", 2023, 0)
+        item.update({
+            "doi": "https://doi.org/10.1/resolved", "title": "Resolvable paper",
+            "authorships": [{"author": {"display_name": "Bob Two"}}],
+        })
+        return httpx.Response(200, json={"results": [item]})
+
+    client = OpenAlexClient("https://api.test", transport=httpx.MockTransport(handler), max_retries=0)
+    seed = parse_work(payload("WSEED", 2025, 0))
+    seed.arxiv_id = "2501.00001"
+    seed.referenced_works = []
+    try:
+        works, report = client.backward(seed, 2, lambda: None)
+    finally:
+        client.close()
+
+    assert len(works) == 2
+    provisional = next(item for item in works if item.canonical_id.startswith("bibliography:"))
+    assert provisional.raw["resolution_status"] == "source_attested_unresolved"
+    assert any(item.canonical_id == "doi:10.1/resolved" for item in works)
+    assert report["unresolved"] == 1
+    assert report["provisional"] == 1
+    assert report["lookup_failures"] == 1
 

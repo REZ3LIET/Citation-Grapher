@@ -7,20 +7,20 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.config import get_settings
 from ..core.database import get_db
 from ..core.runner import dumps, loads, runner
-from ..exports import export_run
+from ..exports import build_subset_archive, export_run
 from ..models import CitationRecord, PaperRecord, RunRecord
 from ..providers import OpenAlexClient, ProviderBudgetExceeded, ProviderRateLimited
 from ..providers.grobid import identify_pdf
 from ..providers.arxiv import search_arxiv
 from ..schemas import (
-    CitationView, GraphView, PaperView, RunCreate, RunExpand, RunSummary,
+    CitationView, GraphView, PaperView, RunCreate, RunExpand, RunSummary, SubsetExportRequest,
     TopicSearchPaper, TopicSearchRequest, TopicSearchResponse,
 )
 
@@ -271,6 +271,22 @@ def download_export(run_id: str, filename: str, db: Session = Depends(get_db)):
     if path.parent != expected_parent or not path.is_file():
         raise HTTPException(404, "Export is not available")
     return FileResponse(path, filename=filename)
+
+
+@router.post("/runs/{run_id}/exports/subset")
+def download_subset_export(run_id: str, payload: SubsetExportRequest, db: Session = Depends(get_db)):
+    run = get_run_or_404(run_id, db)
+    try:
+        archive = build_subset_archive(
+            db, run, payload.paper_ids, payload.filter_expression, payload.filters,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return Response(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="citation-subset-{run_id[:8]}.zip"'},
+    )
 
 
 def _parse_json_cell(value: str, expected):

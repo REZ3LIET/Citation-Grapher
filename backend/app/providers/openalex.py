@@ -69,16 +69,21 @@ class _ArxivBibliographyParser(HTMLParser):
         self.current: dict | None = None
         self.current_anchor: dict | None = None
         self.in_tag = False
+        self.in_block = False
+        self.block_parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = {key.lower(): value for key, value in attrs if value is not None}
         classes = set(attributes.get("class", "").split())
         if tag.lower() == "li" and attributes.get("id", "").startswith("bib.bib"):
-            self.current = {"text_parts": [], "anchors": [], "tag_parts": []}
+            self.current = {"text_parts": [], "anchors": [], "tag_parts": [], "blocks": []}
         elif self.current is not None and tag.lower() == "a":
             self.current_anchor = {"href": attributes.get("href", ""), "text_parts": []}
         elif self.current is not None and tag.lower() == "span" and "ltx_tag_bibitem" in classes:
             self.in_tag = True
+        elif self.current is not None and tag.lower() == "span" and "ltx_bibblock" in classes:
+            self.in_block = True
+            self.block_parts = []
 
     def handle_data(self, data: str) -> None:
         if self.current is None:
@@ -88,6 +93,8 @@ class _ArxivBibliographyParser(HTMLParser):
             self.current_anchor["text_parts"].append(data)
         if self.in_tag:
             self.current["tag_parts"].append(data)
+        if self.in_block:
+            self.block_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if self.current is None:
@@ -100,22 +107,36 @@ class _ArxivBibliographyParser(HTMLParser):
             self.current_anchor = None
         elif tag.lower() == "span" and self.in_tag:
             self.in_tag = False
+        elif tag.lower() == "span" and self.in_block:
+            block = " ".join("".join(self.block_parts).split()).strip()
+            if block:
+                self.current["blocks"].append(block)
+            self.block_parts = []
+            self.in_block = False
         elif tag.lower() == "li":
             raw = " ".join("".join(self.current.pop("text_parts")).split())
             tag_text = " ".join("".join(self.current.pop("tag_parts")).split())
             anchors = self.current.get("anchors", [])
             title = max((item.get("text", "") for item in anchors), key=len, default=None)
+            blocks = self.current.get("blocks", [])
+            if not title and len(blocks) >= 2:
+                # LaTeXML normally emits authors/year, title, then venue as
+                # separate bibliography blocks. Plain-text titles have no link.
+                title = blocks[1].strip().rstrip(".") or None
             combined = " ".join([raw, *(item.get("href", "") for item in anchors)])
             doi_match = re.search(r"10\.\d{4,9}/[^\s\"<>?#]+", combined, re.I)
             arxiv_match = re.search(r"(?:arxiv[:./ ]+|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5})", combined, re.I)
             year_match = re.search(r"\b((?:19|20)\d{2})\b", raw)
-            author_label = re.sub(r"\s*\((?:19|20)\d{2}[a-z]?\).*", "", tag_text, flags=re.I)
-            first_author = re.split(r"\s+(?:et\s+al\.|and|&)\s+", author_label, maxsplit=1, flags=re.I)[0]
+            author_block = blocks[0] if blocks else tag_text
+            author_block = re.sub(r"\s+(?:19|20)\d{2}[a-z]?\.?\s*$", "", author_block, flags=re.I)
+            first_author = re.split(r",|\s+(?:et\s+al\.|and|&)\s+", author_block, maxsplit=1, flags=re.I)[0]
+            title_url = next((item.get("href") for item in anchors if item.get("text") == title), None)
             self.references.append({
                 "title": title, "doi": doi_match.group(0).rstrip(".,;)") if doi_match else None,
                 "arxiv_id": arxiv_match.group(1) if arxiv_match else None,
                 "year": int(year_match.group(1)) if year_match else None,
                 "first_author": first_author or None, "raw": raw,
+                "url": title_url, "position": len(self.references) + 1,
             })
             self.current = None
 
@@ -197,6 +218,42 @@ def parse_work(payload: dict, resolution_method: str | None = None) -> Work:
         referenced_works=[_short_openalex_id(item) for item in payload.get("referenced_works") or []],
         raw=payload,
         resolution_method=resolution_method,
+    )
+
+
+def parse_semantic_scholar_work(payload: dict) -> Work:
+    external_ids = payload.get("externalIds") or {}
+    doi = external_ids.get("DOI")
+    doi = doi.lower() if doi else None
+    arxiv_id = external_ids.get("ArXiv")
+    if doi:
+        canonical = f"doi:{doi}"
+    elif arxiv_id:
+        doi = f"10.48550/arxiv.{arxiv_id.lower()}"
+        canonical = f"doi:{doi}"
+    else:
+        canonical = f"semantic_scholar:{payload['paperId']}"
+    url = payload.get("url")
+    if not url and arxiv_id:
+        url = f"https://arxiv.org/abs/{arxiv_id}"
+    elif not url and doi:
+        url = f"https://doi.org/{doi}"
+    return Work(
+        canonical_id=canonical, openalex_id=None, doi=doi, arxiv_id=arxiv_id,
+        title=(payload.get("title") or "Untitled").strip(),
+        authors=[
+            author.get("name", "").strip()
+            for author in payload.get("authors") or []
+            if author.get("name")
+        ],
+        year=payload.get("year"), venue=payload.get("venue"),
+        abstract=payload.get("abstract"), url=url,
+        citation_count=payload.get("citationCount"), referenced_works=[],
+        raw={
+            "provider": "semantic_scholar",
+            "semantic_scholar_id": payload.get("paperId"),
+        },
+        resolution_method="citation_edge:semantic_scholar",
     )
 
 
@@ -371,7 +428,8 @@ class OpenAlexClient:
         references = parser.references
         works: list[Work] = []
         unresolved = 0
-        provider_failed = False
+        lookup_failures = 0
+        provisional = 0
         seen: set[str] = set()
         limited = references[:limit]
         by_doi: dict[str, dict] = {}
@@ -382,7 +440,7 @@ class OpenAlexClient:
             if doi:
                 by_doi[doi.lower()] = reference
 
-        resolved_dois: set[str] = set()
+        resolved_positions: set[int] = set()
         doi_values = list(by_doi)
         for start in range(0, len(doi_values), 50):
             try:
@@ -395,58 +453,97 @@ class OpenAlexClient:
                     resolved = parse_work(item, "bibliography_identifier")
                     if not resolved.doi or resolved.doi not in by_doi:
                         continue
-                    resolved_dois.add(resolved.doi)
                     if resolved.canonical_id in seen or resolved.canonical_id == work.canonical_id:
                         continue
                     seen.add(resolved.canonical_id)
                     reference = by_doi[resolved.doi]
+                    resolved_positions.add(reference["position"])
                     resolved.raw.setdefault("bibliography_evidence", {
                         "source_arxiv_id": work.arxiv_id,
+                        "reference_position": reference["position"],
                         "raw_reference": reference.get("raw"),
                     })
                     works.append(resolved)
-            except (httpx.HTTPError, ProviderBudgetExceeded):
-                provider_failed = True
-                break
-        unresolved += len(set(doi_values) - resolved_dois)
+            except (httpx.HTTPError, ProviderBudgetExceeded, ProviderRateLimited):
+                lookup_failures += len(doi_values[start : start + 50])
 
         for reference in limited:
-            if provider_failed:
-                break
-            if reference.get("doi") or reference.get("arxiv_id"):
+            if reference["position"] in resolved_positions:
                 continue
-            payload = None
+            resolved = None
             try:
-                if reference.get("title"):
+                # An arXiv identifier is authoritative even when OpenAlex has
+                # not indexed the work or maps the DOI incorrectly.
+                if reference.get("arxiv_id"):
+                    from .arxiv import resolve_arxiv
+
+                    metadata = resolve_arxiv(reference["arxiv_id"], consume_request)
+                    if metadata and metadata.get("year") is not None:
+                        arxiv_id = metadata["arxiv_id"]
+                        doi = f"10.48550/arxiv.{arxiv_id.lower()}"
+                        resolved = Work(
+                            canonical_id=f"doi:{doi}", openalex_id=None, doi=doi,
+                            arxiv_id=arxiv_id, title=metadata["title"],
+                            authors=metadata["authors"], year=metadata["year"],
+                            venue="arXiv", abstract=metadata["abstract"], url=metadata["url"],
+                            citation_count=None, raw={"provider": "arxiv"},
+                            resolution_method="bibliography_identifier:arxiv_api",
+                        )
+                elif reference.get("url") and ACL_RE.fullmatch(reference["url"]):
+                    resolved = self.resolve(reference["url"], consume_request)
+                elif reference.get("title"):
                     search = self._get(
-                        "/works", {"search": reference["title"], "per-page": 5}, consume_request
+                        "/works", {"search.exact": reference["title"], "per-page": 5}, consume_request
                     )
                     payload = next((
                         item for item in search.get("results") or []
                         if _conservative_reference_match(item, reference)
                     ), None)
-            except (httpx.HTTPError, ProviderBudgetExceeded):
-                provider_failed = True
-                break
-            if payload is None:
+                    if payload is not None:
+                        resolved = parse_work(payload, "bibliography_exact_title_author_year_match")
+            except (httpx.HTTPError, ProviderBudgetExceeded, ProviderRateLimited):
+                lookup_failures += 1
+
+            if resolved is None:
                 unresolved += 1
-                continue
-            resolved = parse_work(payload, "bibliography_identifier_or_exact_match")
+                # Retain source-attested entries without claiming a canonical
+                # match. A known year is required so run year constraints and
+                # the non-null storage schema remain truthful.
+                if reference.get("year") is None:
+                    continue
+                provisional += 1
+                resolved = Work(
+                    canonical_id=(
+                        f"bibliography:arxiv:{work.arxiv_id}:ref:{reference['position']}"
+                    ),
+                    openalex_id=None, doi=None, arxiv_id=None,
+                    title=reference.get("title") or reference.get("raw") or "Unresolved reference",
+                    authors=[reference["first_author"]] if reference.get("first_author") else [],
+                    year=reference["year"], venue=None, abstract=None,
+                    url=reference.get("url"), citation_count=None,
+                    raw={"provider": "source_bibliography", "resolution_status": "source_attested_unresolved"},
+                    resolution_method="source_attested_unresolved",
+                )
+
             if resolved.canonical_id in seen or resolved.canonical_id == work.canonical_id:
                 continue
             seen.add(resolved.canonical_id)
             resolved.raw.setdefault("bibliography_evidence", {
-                "source_arxiv_id": work.arxiv_id, "raw_reference": reference.get("raw"),
+                "source_arxiv_id": work.arxiv_id,
+                "reference_position": reference["position"],
+                "raw_reference": reference.get("raw"),
             })
+            resolved_positions.add(reference["position"])
             works.append(resolved)
         capped = len(references) > limit
         return works, {
             "retrieved": len(works), "known_total": len(references),
             "bibliography_total": len(references), "unresolved": unresolved,
+            "provisional": provisional, "lookup_failures": lookup_failures,
             "source": "arxiv_html_bibliography", "capped": capped,
-            "failed": provider_failed,
+            "failed": bool(lookup_failures),
             "reason": (
-                "provider_failure" if provider_failed else
+                "provider_failure" if lookup_failures else
                 "candidate_budget" if capped else
                 "unresolved_bibliography_entries" if unresolved else None
             ),
@@ -462,8 +559,65 @@ class OpenAlexClient:
         consume_request,
         start_cursor: str = "*",
     ) -> tuple[list[Work], dict]:
+        openalex_report: dict
         if not work.openalex_id:
-            return [], {"retrieved": 0, "unsupported": True, "reason": "missing_openalex_id"}
+            openalex_report = {
+                "provider": "openalex", "retrieved": 0, "unsupported": True,
+                "reason": "missing_openalex_id",
+            }
+            works = []
+        else:
+            try:
+                works, openalex_report = self._forward_openalex(
+                    work, min_year, max_year, max_pages, candidate_limit,
+                    consume_request, start_cursor,
+                )
+            except ProviderBudgetExceeded:
+                raise
+            except ProviderRateLimited as exc:
+                works = []
+                openalex_report = {
+                    "provider": "openalex", "retrieved": 0, "failed": True,
+                    "reason": "provider_daily_budget" if exc.daily_budget_exhausted else "provider_rate_limited",
+                    "retry_after_seconds": exc.retry_after_seconds,
+                }
+            except httpx.HTTPError as exc:
+                works = []
+                openalex_report = {
+                    "provider": "openalex", "retrieved": 0, "failed": True,
+                    "reason": type(exc).__name__,
+                }
+        if works:
+            openalex_report.setdefault("provider", "openalex")
+            openalex_report["provider_attempts"] = [dict(openalex_report)]
+            return works, openalex_report
+
+        semantic_works, semantic_report = self._forward_semantic_scholar(
+            work, min_year, max_year, candidate_limit, consume_request,
+        )
+        report = dict(semantic_report)
+        report["provider_attempts"] = [openalex_report, semantic_report]
+        if semantic_works:
+            report["fallback_from"] = "openalex"
+            return semantic_works, report
+        report["failed"] = bool(openalex_report.get("failed") or semantic_report.get("failed"))
+        if report["failed"]:
+            report["reason"] = semantic_report.get("reason") or openalex_report.get("reason")
+        elif openalex_report.get("unsupported") and semantic_report.get("unsupported"):
+            report["unsupported"] = True
+            report["reason"] = "missing_provider_identifier"
+        return [], report
+
+    def _forward_openalex(
+        self,
+        work: Work,
+        min_year: int,
+        max_year: int,
+        max_pages: int,
+        candidate_limit: int,
+        consume_request,
+        start_cursor: str,
+    ) -> tuple[list[Work], dict]:
         cursor = start_cursor
         works: list[Work] = []
         pages = 0
@@ -488,11 +642,75 @@ class OpenAlexClient:
             cursor = next_cursor
         capped = bool(cursor) and (pages >= max_pages or len(works) >= candidate_limit)
         return works[:candidate_limit], {
+            "provider": "openalex",
             "retrieved": min(len(works), candidate_limit),
             "known_total": known_total,
             "pages": pages,
             "next_cursor": cursor if capped else None,
             "capped": capped,
             "reason": "page_or_candidate_budget" if capped else None,
+        }
+
+    def _forward_semantic_scholar(
+        self,
+        work: Work,
+        min_year: int,
+        max_year: int,
+        candidate_limit: int,
+        consume_request,
+    ) -> tuple[list[Work], dict]:
+        if work.arxiv_id:
+            identifier = f"ARXIV:{work.arxiv_id}"
+        elif work.doi:
+            identifier = f"DOI:{work.doi}"
+        else:
+            return [], {
+                "provider": "semantic_scholar", "retrieved": 0,
+                "unsupported": True, "reason": "missing_external_identifier",
+            }
+        try:
+            payload = self._get(
+                f"https://api.semanticscholar.org/graph/v1/paper/{quote(identifier, safe=':')}/citations",
+                {
+                    "fields": (
+                        "citingPaper.paperId,citingPaper.externalIds,citingPaper.title,"
+                        "citingPaper.authors,citingPaper.year,citingPaper.venue,"
+                        "citingPaper.abstract,citingPaper.url,citingPaper.citationCount"
+                    ),
+                    "limit": min(100, candidate_limit),
+                },
+                consume_request,
+            )
+        except ProviderBudgetExceeded:
+            raise
+        except ProviderRateLimited as exc:
+            return [], {
+                "provider": "semantic_scholar", "retrieved": 0, "failed": True,
+                "reason": "provider_daily_budget" if exc.daily_budget_exhausted else "provider_rate_limited",
+                "retry_after_seconds": exc.retry_after_seconds,
+            }
+        except httpx.HTTPError as exc:
+            return [], {
+                "provider": "semantic_scholar", "retrieved": 0, "failed": True,
+                "reason": type(exc).__name__,
+            }
+        works = []
+        excluded_by_year = 0
+        for entry in payload.get("data") or []:
+            paper = entry.get("citingPaper") or {}
+            if not paper.get("paperId"):
+                continue
+            parsed = parse_semantic_scholar_work(paper)
+            if parsed.year is None or not min_year <= parsed.year <= max_year:
+                excluded_by_year += 1
+                continue
+            works.append(parsed)
+        next_offset = payload.get("next")
+        capped = next_offset is not None or len(works) >= candidate_limit
+        return works[:candidate_limit], {
+            "provider": "semantic_scholar", "retrieved": min(len(works), candidate_limit),
+            "known_total": None, "pages": 1, "next_offset": next_offset,
+            "excluded_by_year_at_provider": excluded_by_year,
+            "capped": capped, "reason": "candidate_budget" if capped else None,
         }
 

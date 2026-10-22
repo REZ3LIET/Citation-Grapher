@@ -210,7 +210,10 @@ class DiscoveryRunner:
             "referenced_works": work.referenced_works,
             **{
                 key: work.raw[key]
-                for key in ("bibliography_evidence", "seed_source", "provider", "anthology_id")
+                for key in (
+                    "bibliography_evidence", "seed_source", "provider", "anthology_id",
+                    "resolution_status",
+                )
                 if key in work.raw
             },
         }
@@ -361,11 +364,13 @@ class DiscoveryRunner:
 
     def _candidate_from_work(self, work: Work, parent: PaperRecord, direction: str) -> Candidate:
         provenance = loads(parent.provenance_json, {})
+        provider = work.raw.get("provider") or ("openalex" if work.openalex_id else "unknown")
         return Candidate(
             work=work,
             parents={parent.canonical_id},
             directions={direction},
             frontiers=set(provenance.get("frontiers", [])),
+            providers={provider},
         )
 
     def _collect_frontier(self, session, run: RunRecord, provider: OpenAlexClient, checkpoint: dict) -> dict:
@@ -579,12 +584,19 @@ class DiscoveryRunner:
             if not existing and paper_count >= self.settings.paper_hard_limit:
                 checkpoint["force_finalize"] = "partial_limit_reached"
                 break
+            paper_provenance = {
+                "providers": sorted(candidate.providers),
+                "frontiers": sorted(candidate.frontiers),
+                "directions": sorted(candidate.directions),
+                "parents": sorted(candidate.parents),
+            }
+            if candidate.work.raw.get("resolution_status"):
+                paper_provenance["resolution_status"] = candidate.work.raw["resolution_status"]
+            if candidate.work.raw.get("bibliography_evidence"):
+                paper_provenance["bibliography_evidence"] = candidate.work.raw["bibliography_evidence"]
             paper = self._store_paper(
                 session, run.id, candidate.work, is_seed=False, depth=depth,
-                provenance={"providers": sorted(candidate.providers),
-                            "frontiers": sorted(candidate.frontiers),
-                            "directions": sorted(candidate.directions),
-                            "parents": sorted(candidate.parents)},
+                provenance=paper_provenance,
             )
             if not existing:
                 next_frontier.append(paper.canonical_id)
@@ -596,10 +608,11 @@ class DiscoveryRunner:
             for parent_id in candidate.parents:
                 if "backward" in candidate.directions:
                     self._add_edge(session, run.id, parent_id, paper.canonical_id,
-                                   {"provider": "openalex", "stage": "discovery"})
+                                   {"providers": sorted(candidate.providers), "stage": "discovery",
+                                    "evidence": "source_bibliography"})
                 if "forward" in candidate.directions:
                     self._add_edge(session, run.id, paper.canonical_id, parent_id,
-                                   {"provider": "openalex", "stage": "discovery"})
+                                   {"providers": sorted(candidate.providers), "stage": "discovery"})
             checkpoint["schedule_index"] = index + 1
             checkpoint["next_frontier"] = next_frontier
             run.checkpoint_json = dumps(checkpoint)

@@ -1,5 +1,8 @@
 from fastapi.testclient import TestClient
+import csv
+import io
 import json
+import zipfile
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -60,8 +63,20 @@ p2,p1,{},2026-10-20,
         assert response.status_code == 201, response.text
         run = response.json()
         graph = client.get(f"/api/runs/{run['id']}/graph").json()
+        subset_response = client.post(f"/api/runs/{run['id']}/exports/subset", json={
+            "paper_ids": ["p1"],
+            "filter_expression": "graphs AND causal",
+            "filters": {"min_year": 2024},
+        })
     assert len(graph["papers"]) == 2
     assert graph["citations"] == [{"source": "p2", "target": "p1", "provenance": {}}]
+    assert subset_response.status_code == 200
+    assert subset_response.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(subset_response.content)) as bundle:
+        subset_papers = list(csv.DictReader(io.StringIO(bundle.read("papers.csv").decode())))
+        subset_edges = list(csv.DictReader(io.StringIO(bundle.read("citations.csv").decode())))
+    assert [row["paper_id"] for row in subset_papers] == ["p1"]
+    assert subset_edges == []
 
 
 def test_completed_level_can_resume_in_place(monkeypatch):

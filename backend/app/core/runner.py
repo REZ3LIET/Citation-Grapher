@@ -67,6 +67,13 @@ class DiscoveryRunner:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="citation-discovery")
         self._scheduled: set[str] = set()
         self._lock = threading.Lock()
+        self._annotator: TopicAnnotator | None = None
+
+    def _topic_annotator(self) -> TopicAnnotator:
+        # Loading the embedding model is expensive; reuse it across levels and runs.
+        if self._annotator is None:
+            self._annotator = TopicAnnotator(self.settings.embedding_model, self.settings.topic_threshold)
+        return self._annotator
 
     def enqueue(self, run_id: str) -> None:
         with self._lock:
@@ -373,6 +380,57 @@ class DiscoveryRunner:
             providers={provider},
         )
 
+    def _prune_by_topic(self, run: RunRecord, config: dict, candidates: dict[str, Candidate], level: int) -> None:
+        """Drop collected candidates whose best guiding-topic score is below the threshold.
+
+        Runs once per level before scheduling, so pruned papers are never stored,
+        linked, or expanded. Papers without enough text to score are kept, and every
+        pruned paper is recorded as an exclusion rather than silently dropped.
+        """
+        if not config.get("topic_filter") or not candidates:
+            return
+        threshold = float(config.get("topic_filter_threshold", self.settings.topic_threshold))
+        annotator = self._topic_annotator()
+        items = list(candidates.items())
+        results, metadata = annotator.annotate(
+            [{"title": item.work.title, "abstract": item.work.abstract} for _, item in items],
+            config["topics"],
+        )
+        pruned = kept_unscorable = 0
+        for (key, _candidate), result in zip(items, results):
+            if result["status"] != "classified":
+                kept_unscorable += 1
+                continue
+            best = max(result["scores"].values(), default=0.0)
+            if best < threshold:
+                del candidates[key]
+                pruned += 1
+                self._add_exclusion(run, "below_topic_relevance", key, level=level,
+                                    best_score=round(best, 4), threshold=threshold)
+        counters = loads(run.counters_json, {})
+        counters["topic_pruned"] = int(counters.get("topic_pruned") or 0) + pruned
+        run.counters_json = dumps(counters)
+        coverage = loads(run.coverage_json, {})
+        summary = coverage.setdefault("topic_filter", {
+            "threshold": threshold, "score": "max cosine similarity across guiding topics",
+            "unscorable_policy": "kept", "levels": [],
+        })
+        summary["backend"] = metadata["backend"]
+        summary["model"] = metadata["model"]
+        summary["levels"] = [item for item in summary["levels"] if item.get("level") != level] + [{
+            "level": level, "scored": len(items) - kept_unscorable, "pruned": pruned,
+            "kept": len(candidates), "kept_unscorable": kept_unscorable,
+        }]
+        run.coverage_json = dumps(coverage)
+        if metadata["backend"].startswith("local-hash") and not any(
+            item.get("code") == "topic_filter_fallback" for item in loads(run.warnings_json, [])
+        ):
+            self._add_warning(
+                run, "topic_filter_fallback",
+                "Topic filtering used the local fallback embedding, which approximates keyword "
+                "overlap; install the embeddings extra for semantic filtering.",
+            )
+
     def _collect_frontier(self, session, run: RunRecord, provider: OpenAlexClient, checkpoint: dict) -> dict:
         config = loads(run.config_json, {})
         depth = checkpoint["depth"]
@@ -393,6 +451,9 @@ class DiscoveryRunner:
         )
 
         def seal_candidates(finalize_after: str | None = None) -> dict:
+            # Pruning and sealing commit together, so a restart re-collects and
+            # re-prunes deterministically instead of recording exclusions twice.
+            self._prune_by_topic(run, config, candidates, depth + 1)
             ordered = schedule_balanced(list(candidates.values()), checkpoint["seed_order"])
             checkpoint.update({
                 "stage": "scheduling",
@@ -702,7 +763,7 @@ class DiscoveryRunner:
         session.commit()
         config = loads(run.config_json, {})
         papers = session.scalars(select(PaperRecord).where(PaperRecord.run_id == run.id)).all()
-        annotator = TopicAnnotator(self.settings.embedding_model, self.settings.topic_threshold)
+        annotator = self._topic_annotator()
         results, metadata = annotator.annotate(
             [{"title": paper.title, "abstract": paper.abstract} for paper in papers], config["topics"]
         )

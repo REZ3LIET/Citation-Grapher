@@ -433,8 +433,9 @@ unprocessed frontier, not invalid retained data.
 
 ## 10. Topic annotation
 
-Guiding topics annotate papers after citation discovery. They do not prune BFS
-and do not create citation relationships.
+Guiding topics annotate papers after citation discovery. They never create
+citation relationships, and by default they do not prune BFS (see 10.1 for the
+opt-in filter).
 
 The preferred model is:
 
@@ -450,6 +451,29 @@ local hash-embedding fallback and records `embedding_fallback`. These scores are
 heuristic cosine similarities, not probabilities. The fallback can produce
 lower-quality classifications even when a title contains an obviously related
 concept.
+
+### 10.1 Optional topic filtering during discovery
+
+Study configuration offers **Only keep papers related to these topics while
+discovering** (`topic_filter`, default off), with a minimum relevance
+(`topic_filter_threshold`, default the server's `topic_threshold`, `0.35`).
+
+When enabled, each level's collected candidates are scored against the guiding
+topics after collection and year filtering, before they are scheduled. A
+candidate is pruned when its highest score across all topics is below the
+threshold. Pruned papers are:
+
+- not retained, linked, or expanded at later levels, so the 500 and 1,000-paper
+  limits are spent on relevant papers;
+- recorded as `below_topic_relevance` exclusions with their level, best score,
+  and threshold; and
+- counted in `counters.topic_pruned` and per level in `coverage.topic_filter`.
+
+Seeds are never pruned. Candidates with too little text to score (fewer than
+three title/abstract tokens) are kept. Pruning is a user-selected inclusion
+rule like the year range, so it does not mark the run retrieval-incomplete.
+With the hash-embedding fallback the filter approximates keyword overlap and
+the run records a `topic_filter_fallback` warning.
 
 ## 11. Explorer and visualization
 
@@ -531,6 +555,24 @@ Evaluation works as follows:
 The literal fallback allows aliases such as `LLMs` and `Large language models`
 to be useful even when only one form was supplied as an embedding topic. It is
 literal evidence and does not invent a similarity score.
+
+### 12.1 Topic chips and graph display
+
+Below the expression field, every scored topic in the run appears as a toggle
+chip. Selected chips are joined with `OR` (**Any selected**) or `AND` (**All
+selected**) and combined with any typed expression using `AND`. Chips use the
+same relevance threshold and evaluation rules as typed terms.
+
+The **Graph** toggle controls how topic filtering affects the citation graph:
+
+- **Highlight matches** (default): the graph keeps every paper that passes the
+  non-topic filters. Matching papers get a blue ring, and non-matching papers
+  and their edges are dimmed but stay visible for context.
+- **Hide others**: non-matching papers are removed from the graph.
+
+The Discovered Papers list and subset export always contain only matching
+papers. The subset export records the combined expression and the selected
+chips.
 
 ## 13. Full-run exports
 

@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 import app.core.runner as runner_module
 from app.core.config import Settings
 from app.core.runner import DiscoveryRunner
-from app.models import Base, PaperRecord, RunRecord
+from app.models import Base, CitationRecord, PaperRecord, RunRecord
 from app.providers import ProviderRateLimited, Work
 
 
@@ -369,3 +369,89 @@ def test_requested_levels_are_completed_and_checkpointed_sequentially(monkeypatc
         assert checkpoint["highest_completed_level"] == 2
         assert {paper.depth for paper in papers} == {0, 1, 2}
 
+
+
+class TopicMixProvider(FakeProvider):
+    def backward(self, work, _limit, consume):
+        consume()
+        if work.openalex_id != "S1":
+            return [], {"retrieved": 0, "known_total": 0, "capped": False, "reason": None}
+        relevant = make_work("REL", 2025)
+        relevant.title, relevant.abstract = "Machine unlearning for language models", None
+        off_topic = make_work("OFF", 2025)
+        off_topic.title, off_topic.abstract = "Protein folding with diffusion", None
+        unscorable = make_work("UNK", 2025)
+        unscorable.title, unscorable.abstract = "Errata", None
+        found = [relevant, off_topic, unscorable]
+        return found, {"retrieved": 3, "known_total": 3, "capped": False, "reason": None}
+
+
+class KeywordAnnotator:
+    """Scores 0.9 when a title mentions a topic, 0.1 otherwise; short titles are unscorable."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def annotate(self, papers, topics):
+        results = []
+        for paper in papers:
+            title = (paper.get("title") or "").lower()
+            if len(title.split()) < 3:
+                results.append({"topics": [], "scores": {}, "status": "unclassified"})
+                continue
+            scores = {topic: 0.9 if topic in title else 0.1 for topic in topics}
+            labels = [topic for topic, score in scores.items() if score >= 0.35]
+            results.append({"topics": labels, "scores": scores, "status": "classified"})
+        return results, {"model": "keyword", "backend": "keyword-test"}
+
+
+def run_topic_mix(monkeypatch, tmp_path, run_id, **config_overrides):
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(runner_module, "SessionLocal", sessions)
+    monkeypatch.setattr(runner_module, "OpenAlexClient", TopicMixProvider)
+    monkeypatch.setattr(runner_module, "TopicAnnotator", KeywordAnnotator)
+    settings = Settings(database_url="sqlite://", runs_dir=tmp_path, max_provider_requests_per_run=20)
+    config = {
+        "seeds": ["seed one"], "topics": ["unlearning"],
+        "min_year": 2020, "max_year": 2026, "direction": "backward", "depth": 1,
+        **config_overrides,
+    }
+    with sessions() as session:
+        session.add(RunRecord(
+            id=run_id, phase="created", config_json=json.dumps(config),
+            counters_json='{"provider_requests":0}', warnings_json="[]", exclusions_json="[]",
+            checkpoint_json="{}", coverage_json='{"retrieval_complete":true}',
+        ))
+        session.commit()
+    DiscoveryRunner(settings)._execute(run_id)
+    return sessions
+
+
+def test_topic_filter_prunes_off_topic_candidates_but_keeps_unscorable(monkeypatch, tmp_path):
+    sessions = run_topic_mix(
+        monkeypatch, tmp_path, "topic-filter", topic_filter=True, topic_filter_threshold=0.35,
+    )
+    with sessions() as session:
+        run = session.get(RunRecord, "topic-filter")
+        assert run.phase == "completed"
+        retained = set(session.scalars(select(PaperRecord.canonical_id)).all())
+        assert retained == {"openalex:S1", "openalex:REL", "openalex:UNK"}
+        cited = set(session.scalars(select(CitationRecord.cited_paper_id)).all())
+        assert "openalex:OFF" not in cited
+        exclusions = [item for item in json.loads(run.exclusions_json) if item["reason"] == "below_topic_relevance"]
+        assert [item["value"] for item in exclusions] == ["openalex:OFF"]
+        assert exclusions[0]["level"] == 1 and exclusions[0]["best_score"] == 0.1
+        assert json.loads(run.counters_json)["topic_pruned"] == 1
+        level = json.loads(run.coverage_json)["topic_filter"]["levels"][0]
+        assert level == {"level": 1, "scored": 2, "pruned": 1, "kept": 2, "kept_unscorable": 1}
+
+
+def test_topic_filter_off_keeps_every_candidate(monkeypatch, tmp_path):
+    sessions = run_topic_mix(monkeypatch, tmp_path, "no-topic-filter")
+    with sessions() as session:
+        run = session.get(RunRecord, "no-topic-filter")
+        assert session.scalar(select(func.count(PaperRecord.id))) == 4
+        assert "topic_pruned" not in json.loads(run.counters_json)
+        assert "topic_filter" not in json.loads(run.coverage_json)

@@ -17,6 +17,8 @@ export function StudyConfiguration({ onCreated }: Props) {
   const [maxYear, setMaxYear] = useState(new Date().getFullYear())
   const [direction, setDirection] = useState('both')
   const [depth, setDepth] = useState(1)
+  const [topicFilter, setTopicFilter] = useState(false)
+  const [topicThreshold, setTopicThreshold] = useState(0.35)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [pdfStatus, setPdfStatus] = useState('')
@@ -32,7 +34,8 @@ export function StudyConfiguration({ onCreated }: Props) {
       if (!seedList.length) throw new Error('Select at least one paper to use as a seed')
       const topicList = topics.split(/\n|,/).map((value) => value.trim()).filter(Boolean)
       onCreated(await api.createRun({ seeds: seedList, topics: topicList, min_year: minYear,
-        max_year: maxYear, direction, depth }))
+        max_year: maxYear, direction, depth, topic_filter: topicFilter,
+        topic_filter_threshold: topicFilter ? topicThreshold : null }))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Could not start discovery')
     } finally { setSubmitting(false) }
@@ -108,10 +111,17 @@ export function StudyConfiguration({ onCreated }: Props) {
             <div className="topic-result-list">{topicResults.papers.map((paper) => <label key={paper.id} className="topic-result"><input type="checkbox" checked={selectedResults.includes(paper.id)} onChange={() => setSelectedResults((current) => current.includes(paper.id) ? current.filter((id) => id !== paper.id) : [...current, paper.id])} /><span><b>{paper.year} · {paper.title}</b><small>{paper.authors.slice(0, 3).join(', ') || 'Authors unavailable'} · {paper.citation_count ?? '—'} citations</small></span></label>)}</div>
           </div>}
         </section>}
-        <label>Guiding topics <span>annotation only</span>
+        <label>Guiding topics <span>{topicFilter ? 'annotate and filter discovery' : 'annotation only'}</span>
           <textarea value={topics} onChange={(e) => setTopics(e.target.value)} rows={3}
             placeholder="e.g. retrieval-augmented generation, citation recommendation" required />
         </label>
+        <div className="topic-filter-option">
+          <label className="checkbox-label"><input type="checkbox" checked={topicFilter} onChange={(e) => setTopicFilter(e.target.checked)} /> Only keep papers related to these topics while discovering</label>
+          {topicFilter && <>
+            <label className="threshold-label">Minimum relevance <input aria-label="Minimum topic relevance" type="range" min="0.05" max="0.9" step="0.05" value={topicThreshold} onChange={(e) => setTopicThreshold(+e.target.value)} /><b>{topicThreshold.toFixed(2)}</b></label>
+            <small>Each new paper is scored against the topics as it is found. Papers whose best score is below the minimum aren't added or expanded, and each one is logged as an exclusion. Papers too short to score are kept. Seeds are never filtered.</small>
+          </>}
+        </div>
         <div className="field-row">
           <label>From year<input type="number" value={minYear} onChange={(e) => setMinYear(+e.target.value)} /></label>
           <label>To year<input type="number" value={maxYear} onChange={(e) => setMaxYear(+e.target.value)} /></label>

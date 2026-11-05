@@ -115,6 +115,23 @@ export function parseTopicExpression(expression: string): ParsedTopicExpression 
   }
 }
 
+export type TopicMatchMode = 'any' | 'all'
+
+/** Turns topics picked from the chip list into an expression string the parser accepts. */
+export function topicSelectionExpression(topics: string[], mode: TopicMatchMode): string {
+  return topics
+    .map((topic) => topic.replaceAll('"', '').trim())
+    .filter(Boolean)
+    .map((topic) => `"${topic}"`)
+    .join(mode === 'all' ? ' AND ' : ' OR ')
+}
+
+/** Joins independent topic expressions with AND, keeping each one's own grouping. */
+export function combineTopicExpressions(...expressions: string[]): string {
+  const parts = expressions.map((expression) => expression.trim()).filter(Boolean)
+  return parts.length > 1 ? parts.map((part) => `(${part})`).join(' AND ') : parts[0] ?? ''
+}
+
 function normalized(value: string): string {
   return value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 }

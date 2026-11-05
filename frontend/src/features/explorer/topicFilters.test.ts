@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { Paper } from '../../types'
-import { evaluateTopicExpression, parseTopicExpression } from './topicFilters'
+import {
+  combineTopicExpressions, evaluateTopicExpression, parseTopicExpression, topicSelectionExpression,
+} from './topicFilters'
 
 const paper = (
   scores: Record<string, number>,
@@ -48,5 +50,24 @@ describe('Boolean topic expressions', () => {
     const parsed = parseTopicExpression('"research AND development" OR causal')
     expect(parsed.error).toBeNull()
     expect(parsed.terms).toEqual(['research AND development', 'causal'])
+  })
+})
+
+describe('Topic chip selection', () => {
+  it('builds quoted OR/AND expressions that survive operator words in names', () => {
+    expect(topicSelectionExpression(['causal', 'research AND development'], 'any'))
+      .toBe('"causal" OR "research AND development"')
+    const parsed = parseTopicExpression(topicSelectionExpression(['causal', 'research AND development'], 'all'))
+    expect(parsed.error).toBeNull()
+    expect(parsed.terms).toEqual(['causal', 'research AND development'])
+  })
+
+  it('combines the typed expression with the chip selection using AND', () => {
+    const combined = combineTopicExpressions('LLMs OR unlearning', topicSelectionExpression(['causal'], 'any'))
+    expect(combined).toBe('(LLMs OR unlearning) AND ("causal")')
+    expect(matches(paper({ unlearning: .9, causal: .5 }), combined)).toBe(true)
+    expect(matches(paper({ unlearning: .9, causal: .1 }), combined)).toBe(false)
+    expect(combineTopicExpressions('', '  ')).toBe('')
+    expect(combineTopicExpressions('', 'causal')).toBe('causal')
   })
 })

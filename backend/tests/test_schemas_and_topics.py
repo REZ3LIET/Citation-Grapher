@@ -14,6 +14,8 @@ def test_run_configuration_normalizes_and_validates():
     assert request.topics == ["graphs"]
     assert request.direction == "both"
     assert request.depth == 1
+    assert request.topic_filter is False
+    assert request.topic_filter_threshold is None
 
 
 def test_run_configuration_accepts_one_seed():
@@ -52,3 +54,9 @@ def test_level_expansion_is_bounded():
     with pytest.raises(ValidationError):
         RunExpand(target_level=4)
 
+
+
+def test_topic_filter_threshold_must_be_a_similarity_between_zero_and_one():
+    with pytest.raises(ValidationError):
+        RunCreate(seeds=["doi:one"], topics=["graphs"], min_year=2020, max_year=2025,
+                  topic_filter=True, topic_filter_threshold=1.5)

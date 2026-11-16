@@ -4,7 +4,10 @@ import { api } from '../../api/client'
 import type { GraphData, Paper } from '../../types'
 import { DiscoveredPapers } from './DiscoveredPapers'
 import { GraphCanvas } from './GraphCanvas'
-import { evaluateTopicExpression, parseTopicExpression } from './topicFilters'
+import {
+  combineTopicExpressions, evaluateTopicExpression, parseTopicExpression, topicSelectionExpression,
+  type TopicMatchMode,
+} from './topicFilters'
 
 type Props = { data: GraphData }
 
@@ -15,6 +18,9 @@ export function Explorer({ data }: Props) {
   const [minYear, setMinYear] = useState(Math.min(...years))
   const [maxYear, setMaxYear] = useState(Math.max(...years))
   const [topicExpression, setTopicExpression] = useState('')
+  const [selectedTopics, setSelectedTopics] = useState<string[]>([])
+  const [topicMatchMode, setTopicMatchMode] = useState<TopicMatchMode>('any')
+  const [graphTopicMode, setGraphTopicMode] = useState<'highlight' | 'hide'>('highlight')
   const [minRelevance, setMinRelevance] = useState(0)
   const [role, setRole] = useState('all')
   const [citationMetric, setCitationMetric] = useState<'provider' | 'internal'>('provider')
@@ -26,8 +32,18 @@ export function Explorer({ data }: Props) {
   const [exportingSubset, setExportingSubset] = useState(false)
   const [subsetExportError, setSubsetExportError] = useState<string | null>(null)
   const topics = useMemo(() => [...new Set(data.papers.flatMap((paper) => Object.keys(paper.relevance_scores)))], [data])
+  // The typed expression is parsed alone so its error message refers to what the user typed;
+  // evaluation uses the typed expression AND the chip selection together.
   const parsedTopics = useMemo(() => parseTopicExpression(topicExpression), [topicExpression])
-  const activeTopics = parsedTopics.terms
+  const combinedTopicExpression = useMemo(
+    () => combineTopicExpressions(topicExpression, topicSelectionExpression(selectedTopics, topicMatchMode)),
+    [topicExpression, selectedTopics, topicMatchMode],
+  )
+  const parsedCombined = useMemo(() => parseTopicExpression(combinedTopicExpression), [combinedTopicExpression])
+  const topicFilterActive = !!combinedTopicExpression
+  const activeTopics = parsedCombined.terms
+  const toggleTopic = (topic: string) => setSelectedTopics((current) =>
+    current.includes(topic) ? current.filter((item) => item !== topic) : [...current, topic])
   const distanceIds = useMemo(() => {
     if (!selected || distance === 0) return null
     const neighbors = new Map<string, Set<string>>()
@@ -43,14 +59,24 @@ export function Explorer({ data }: Props) {
     }
     return reached
   }, [data.citations, selected, distance])
-  const papers = useMemo(() => data.papers.filter((paper) => {
+  // Every filter except topics. In highlight mode the graph shows this set and only
+  // emphasizes topic matches, so the surrounding citation context stays visible.
+  const nonTopicPapers = useMemo(() => data.papers.filter((paper) => {
     const haystack = `${paper.title} ${paper.authors.join(' ')} ${paper.doi ?? ''} ${paper.id}`.toLowerCase()
     const citationCount = citationMetric === 'provider' ? (paper.provider_citation_count ?? 0) : paper.internal_in_count
     return paper.year >= minYear && paper.year <= maxYear && haystack.includes(query.toLowerCase())
       && (role === 'all' || (role === 'seed') === paper.is_seed)
-      && (!topicExpression.trim() || (!!parsedTopics.ast && evaluateTopicExpression(paper, parsedTopics.ast, minRelevance)))
       && citationCount >= minCitations && (!distanceIds || distanceIds.has(paper.id))
-  }).sort((a, b) => b.year - a.year || (Math.max(...activeTopics.map((topic) => Object.entries(b.relevance_scores).find(([name]) => name.toLowerCase() === topic.toLowerCase())?.[1] ?? 0), 0) - Math.max(...activeTopics.map((topic) => Object.entries(a.relevance_scores).find(([name]) => name.toLowerCase() === topic.toLowerCase())?.[1] ?? 0), 0)) || a.title.localeCompare(b.title)), [data, minYear, maxYear, query, role, topicExpression, parsedTopics, activeTopics, minRelevance, citationMetric, minCitations, distanceIds])
+  }), [data, minYear, maxYear, query, role, citationMetric, minCitations, distanceIds])
+  const papers = useMemo(() => nonTopicPapers.filter((paper) =>
+    !topicFilterActive || (!!parsedCombined.ast && evaluateTopicExpression(paper, parsedCombined.ast, minRelevance)),
+  ).sort((a, b) => b.year - a.year || (Math.max(...activeTopics.map((topic) => Object.entries(b.relevance_scores).find(([name]) => name.toLowerCase() === topic.toLowerCase())?.[1] ?? 0), 0) - Math.max(...activeTopics.map((topic) => Object.entries(a.relevance_scores).find(([name]) => name.toLowerCase() === topic.toLowerCase())?.[1] ?? 0), 0)) || a.title.localeCompare(b.title)), [nonTopicPapers, topicFilterActive, parsedCombined, activeTopics, minRelevance])
+  const highlightTopics = topicFilterActive && graphTopicMode === 'highlight'
+  const graphPapers = highlightTopics ? nonTopicPapers : papers
+  const topicMatchIds = useMemo(
+    () => highlightTopics ? new Set(papers.map((paper) => paper.id)) : null,
+    [highlightTopics, papers],
+  )
   const selectedPaper = data.papers.find((paper) => paper.id === selected) ?? null
   const selectPaper = useCallback((id: string) => {
     if (id === selected) return
@@ -69,6 +95,9 @@ export function Explorer({ data }: Props) {
     setMinYear(Math.min(...years))
     setMaxYear(Math.max(...years))
     setTopicExpression('')
+    setSelectedTopics([])
+    setTopicMatchMode('any')
+    setGraphTopicMode('highlight')
     setMinRelevance(0)
     setRole('all')
     setCitationMetric('provider')
@@ -78,17 +107,18 @@ export function Explorer({ data }: Props) {
     setSelectionHistory([])
   }
   const exportSubset = async () => {
-    if (!papers.length || parsedTopics.error) return
+    if (!papers.length || parsedCombined.error) return
     setExportingSubset(true)
     setSubsetExportError(null)
     try {
       const blob = await api.exportSubset(data.run.id, {
         paper_ids: papers.map((paper) => paper.id),
-        filter_expression: topicExpression.trim() || null,
+        filter_expression: combinedTopicExpression || null,
         filters: {
           query, min_year: minYear, max_year: maxYear, role,
           minimum_relevance: minRelevance, citation_metric: citationMetric,
           minimum_citations: minCitations, distance,
+          selected_topics: selectedTopics, topic_match: topicMatchMode,
         },
       })
       const url = URL.createObjectURL(blob)
@@ -105,7 +135,7 @@ export function Explorer({ data }: Props) {
   }
   return <main className="explorer-page">
     <header className="explorer-header"><div><p className="step-label">Citation graph explorer</p><h1>Research connected to your seeds</h1></div>
-      <div className="explorer-actions"><button className="subset-export" disabled={!papers.length || !!parsedTopics.error || exportingSubset} onClick={exportSubset}><Download size={15} /> {exportingSubset ? 'Preparing…' : `Export subset (${papers.length})`}</button><div className="graph-navigation"><button disabled={!selectionHistory.length} onClick={selectPrevious}><ArrowLeft size={15} /> Previous selection</button><button onClick={resetGraph}><RotateCcw size={15} /> Reset graph</button></div><div className="view-toggle"><button className={view === 'split' ? 'active' : ''} onClick={() => setView('split')}><Network size={16} /> Graph + list</button><button className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}><List size={16} /> List first</button></div></div>
+      <div className="explorer-actions"><button className="subset-export" disabled={!papers.length || !!parsedCombined.error || exportingSubset} onClick={exportSubset}><Download size={15} /> {exportingSubset ? 'Preparing…' : `Export subset (${papers.length})`}</button><div className="graph-navigation"><button disabled={!selectionHistory.length} onClick={selectPrevious}><ArrowLeft size={15} /> Previous selection</button><button onClick={resetGraph}><RotateCcw size={15} /> Reset graph</button></div><div className="view-toggle"><button className={view === 'split' ? 'active' : ''} onClick={() => setView('split')}><Network size={16} /> Graph + list</button><button className={view === 'list' ? 'active' : ''} onClick={() => setView('list')}><List size={16} /> List first</button></div></div>
     </header>
     <section className="filter-bar"><Filter size={17} /><label className="search-field"><Search size={16} /><input aria-label="Search papers" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Title, author, DOI, or ID" /></label>
       <label>Years <input aria-label="Minimum year" type="number" value={minYear} onChange={(e) => setMinYear(+e.target.value)} />–<input aria-label="Maximum year" type="number" value={maxYear} onChange={(e) => setMaxYear(+e.target.value)} /></label>
@@ -114,13 +144,22 @@ export function Explorer({ data }: Props) {
       <label>Citations <select value={citationMetric} onChange={(e) => setCitationMetric(e.target.value as 'provider' | 'internal')}><option value="provider">Provider</option><option value="internal">Internal incoming</option></select><input aria-label="Minimum citation count" type="number" min="0" value={minCitations} onChange={(e) => setMinCitations(+e.target.value)} /></label>
       <label>Distance <select value={distance} onChange={(e) => setDistance(+e.target.value)}><option value={0}>All</option><option value={1}>1 hop</option><option value={2}>2 hops</option><option value={3}>3 hops</option></select></label>
     </section>
-    <section className={`boolean-filter ${parsedTopics.error ? 'invalid' : ''}`}><div><strong>Topic logic</strong><span>Type topic names with AND, OR, and parentheses.</span></div><input aria-label="Boolean topic expression" aria-invalid={!!parsedTopics.error} value={topicExpression} onChange={(event) => setTopicExpression(event.target.value)} placeholder="(LLMs OR Large language models) AND unlearning AND (causal OR counterfactual)" />{parsedTopics.error ? <small role="alert">{parsedTopics.error}</small> : <small>{topicExpression ? `${papers.length} matching papers` : `Available scored topics: ${topics.join(', ') || 'none'}`}</small>}</section>
+    <section className={`boolean-filter ${parsedTopics.error ? 'invalid' : ''}`}><div><strong>Topic logic</strong><span>Type topic names with AND, OR, and parentheses.</span></div><input aria-label="Boolean topic expression" aria-invalid={!!parsedTopics.error} value={topicExpression} onChange={(event) => setTopicExpression(event.target.value)} placeholder="(LLMs OR Large language models) AND unlearning AND (causal OR counterfactual)" />{parsedTopics.error ? <small role="alert">{parsedTopics.error}</small> : <small>{topicFilterActive ? `${papers.length} matching papers` : `Available scored topics: ${topics.join(', ') || 'none'}`}</small>}</section>
+    {!!topics.length && <section className="topic-chips" aria-label="Topic filter">
+      <strong>Topics</strong>
+      <div className="chip-list">{topics.map((topic) => <button key={topic} type="button" aria-pressed={selectedTopics.includes(topic)} className={selectedTopics.includes(topic) ? 'active' : ''} onClick={() => toggleTopic(topic)}>{topic}</button>)}</div>
+      <label>Match <select aria-label="Topic match mode" value={topicMatchMode} onChange={(e) => setTopicMatchMode(e.target.value as TopicMatchMode)}><option value="any">Any selected</option><option value="all">All selected</option></select></label>
+      <div className="segmented" role="group" aria-label="Graph topic display"><span>Graph</span>
+        <button type="button" aria-pressed={graphTopicMode === 'highlight'} className={graphTopicMode === 'highlight' ? 'active' : ''} onClick={() => setGraphTopicMode('highlight')}>Highlight matches</button>
+        <button type="button" aria-pressed={graphTopicMode === 'hide'} className={graphTopicMode === 'hide' ? 'active' : ''} onClick={() => setGraphTopicMode('hide')}>Hide others</button>
+      </div>
+    </section>}
     {subsetExportError && <div className="error">{subsetExportError}</div>}
     {data.run.phase === 'completed_partial' && <div className="partial-banner">Partial run · {data.run.outcome?.replaceAll('_', ' ')}. Coverage details remain available in the export report.</div>}
     <div className={`explorer-layout ${view}`}>
       <DiscoveredPapers papers={papers} selected={selected} onSelect={selectPaper} minRelevance={minRelevance} />
-      {view === 'split' && <section className="graph-panel"><GraphCanvas papers={papers} citations={data.citations} selected={selected} onSelect={selectPaper} />
-        <div className="legend"><span><i className="seed-dot" /> Seed</span><span><i /> Discovered</span><small>Arrows point from citing to cited paper</small></div></section>}
+      {view === 'split' && <section className="graph-panel"><GraphCanvas papers={graphPapers} citations={data.citations} selected={selected} onSelect={selectPaper} topicMatches={topicMatchIds} />
+        <div className="legend"><span><i className="seed-dot" /> Seed</span><span><i /> Discovered</span>{topicMatchIds && <span><i className="topic-dot" /> Topic match ({topicMatchIds.size})</span>}<small>Arrows point from citing to cited paper</small></div></section>}
       {selectedPaper && <PaperDetail paper={selectedPaper} edges={data.citations} papers={data.papers} onSelect={selectPaper} />}
     </div>
   </main>

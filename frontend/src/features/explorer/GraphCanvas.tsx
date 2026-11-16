@@ -4,9 +4,13 @@ import { useEffect, useRef, useState } from 'react'
 import type { Citation, Paper } from '../../types'
 import { buildLayeredPositions } from './graphLayout'
 
-type Props = { papers: Paper[]; citations: Citation[]; selected: string | null; onSelect: (id: string) => void }
+type Props = {
+  papers: Paper[]; citations: Citation[]; selected: string | null; onSelect: (id: string) => void
+  /** When set, these papers are emphasized and every other paper is dimmed (not removed). */
+  topicMatches?: Set<string> | null
+}
 
-export function GraphCanvas({ papers, citations, selected, onSelect }: Props) {
+export function GraphCanvas({ papers, citations, selected, onSelect, topicMatches = null }: Props) {
   const container = useRef<HTMLDivElement>(null)
   const instance = useRef<Core | null>(null)
   const [layoutMode, setLayoutMode] = useState<'layers' | 'force' | 'grid'>('layers')
@@ -31,16 +35,21 @@ export function GraphCanvas({ papers, citations, selected, onSelect }: Props) {
       style: [
         { selector: 'node', style: { 'background-color': '#70a98d', width: 15, height: 15, label: '', 'border-width': 2, 'border-color': '#f6f2e8' } },
         { selector: 'node[seed = "yes"]', style: { 'background-color': '#e79b67', width: 22, height: 22 } },
+        { selector: 'node.topic-match', style: { 'border-width': 4, 'border-color': '#8fd3f4' } },
+        { selector: 'node.topic-dim', style: { opacity: 0.18 } },
         { selector: 'node.hovered, node:selected', style: {
+          opacity: 1,
           label: 'data(label)', color: '#f8f5ed', 'font-size': 11, 'font-weight': 600,
           'text-wrap': 'ellipsis', 'text-max-width': '220px', 'text-background-color': '#1b2b24',
           'text-background-opacity': 0.92, 'text-background-padding': '4px',
           'text-valign': 'bottom', 'text-margin-y': 9, 'z-index': 10,
         } },
         { selector: 'node:selected', style: { 'border-width': 5, 'border-color': '#f0c35e', width: 26, height: 26 } },
-        { selector: 'node.related', style: { 'border-width': 4, 'border-color': '#b8d5c5' } },
+        { selector: 'node.related', style: { 'border-width': 4, 'border-color': '#b8d5c5', opacity: 1 } },
         { selector: 'edge', style: { width: 1, 'line-color': '#688078', 'target-arrow-color': '#688078', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', opacity: 0.55 } },
+        { selector: 'edge.topic-dim', style: { opacity: 0.06 } },
         { selector: 'edge.muted', style: { opacity: 0.12 } },
+        { selector: 'edge.muted.topic-dim', style: { opacity: 0.04 } },
         { selector: 'edge.highlighted', style: { width: 3, opacity: 1, 'line-color': '#f0c35e', 'target-arrow-color': '#f0c35e', 'z-index': 8 } },
       ],
       layout: layoutMode === 'layers'
@@ -84,6 +93,17 @@ export function GraphCanvas({ papers, citations, selected, onSelect }: Props) {
       if (!bestPath.edges().length) node.neighborhood('node').addClass('related')
     }
   }, [selected, papers, layoutMode])
+  useEffect(() => {
+    const cy = instance.current
+    if (!cy) return
+    cy.elements().removeClass('topic-match topic-dim')
+    if (!topicMatches) return
+    cy.nodes().forEach((node) => { node.addClass(topicMatches.has(node.id()) ? 'topic-match' : 'topic-dim') })
+    // An edge stays prominent only when it connects two matching papers.
+    cy.edges().forEach((edge) => {
+      if (!topicMatches.has(edge.source().id()) || !topicMatches.has(edge.target().id())) edge.addClass('topic-dim')
+    })
+  }, [topicMatches, papers, layoutMode])
   return <><div className="graph-tools" aria-label="Graph layout controls">
     <span>Layout</span>
     <button className={layoutMode === 'layers' ? 'active' : ''} onClick={() => setLayoutMode('layers')}>Citation layers</button>

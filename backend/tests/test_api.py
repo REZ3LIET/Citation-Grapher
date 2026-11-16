@@ -104,3 +104,16 @@ def test_completed_level_can_resume_in_place(monkeypatch):
         assert json.loads(run.config_json)["depth"] == 2
     assert enqueued == ["expandable"]
 
+
+
+def test_topic_filter_defaults_to_the_configured_threshold(monkeypatch):
+    monkeypatch.setattr("app.api.routes.runner.enqueue", lambda _run_id: None)
+    with TestClient(app) as client:
+        response = client.post("/api/runs", json={
+            "seeds": ["10.1/abc"], "topics": ["unlearning"], "min_year": 2020,
+            "max_year": 2026, "topic_filter": True,
+        })
+    assert response.status_code == 201
+    config = response.json()["config"]
+    assert config["topic_filter"] is True
+    assert config["topic_filter_threshold"] == 0.35

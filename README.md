@@ -28,6 +28,56 @@ identifies uploaded PDFs.
 - Non-destructive filters and offline reconstruction from canonical CSV files.
 - CSV, JSON metadata, and GraphML exports.
 
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph IN["1 · Input"]
+        direction TB
+        I1["Seed papers<br/>DOI · OpenAlex · arXiv · URL"]
+        I2["Topic search<br/>review & select seeds"]
+        I3["PDF via GROBID"]
+        I4["Guiding topics,<br/>year range, direction, depth"]
+    end
+
+    subgraph FIND["2 · Find"]
+        direction TB
+        F1["Resolve seeds<br/>canonical IDs"]
+        F2["Collect frontier<br/>forward first, then backward<br/>OpenAlex · arXiv · ACL · Semantic Scholar"]
+        F3["Year filter<br/>+ optional topic pruning"]
+        F1 --> F2 --> F3
+    end
+
+    subgraph GRAPH["3 · Graph"]
+        direction TB
+        G1["Schedule candidates<br/>low citation count first,<br/>round-robin across seeds"]
+        G2["Store papers & citing → cited edges<br/>checkpoint each level"]
+        G3["Complete internal edges<br/>annotate topic scores"]
+        G1 --> G2 --> G3
+    end
+
+    subgraph FILTER["4 · Filtering"]
+        direction TB
+        L1["Search, years, role,<br/>citations, distance"]
+        L2["Topic logic AND / OR<br/>+ topic chips"]
+    end
+
+    subgraph RENDER["5 · Render"]
+        direction TB
+        R1["Citation-layer graph<br/>highlight or hide matches"]
+        R2["Paper list & details"]
+        R3["Exports<br/>CSV · JSON · GraphML · subset ZIP"]
+    end
+
+    IN --> FIND --> GRAPH --> FILTER --> RENDER
+    G2 -. "next level (up to 3)<br/>pause at 500 · stop at 1,000" .-> F2
+    I5["CSV import"] -. "skips discovery" .-> FILTER
+```
+
+Discovery runs on the backend and is checkpointed in SQLite, so an interrupted
+run resumes where it stopped. Filtering and rendering run in the browser and
+never change the stored graph.
+
 ## Local development
 
 Requirements: Python 3.10+ and Node 20+.

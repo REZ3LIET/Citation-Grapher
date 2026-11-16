@@ -137,6 +137,8 @@ async def identify_seed_pdf(file: UploadFile = File(...)) -> dict:
 def create_run(payload: RunCreate, db: Session = Depends(get_db)) -> RunSummary:
     run_id = str(uuid.uuid4())
     config = payload.model_dump()
+    if config["topic_filter_threshold"] is None:
+        config["topic_filter_threshold"] = settings.topic_threshold
     config["collection_budgets"] = {
         "pages_per_query": settings.max_pages_per_query,
         "candidates_per_parent_direction": settings.max_candidates_per_parent_direction,

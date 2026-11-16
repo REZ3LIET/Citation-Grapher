@@ -16,6 +16,10 @@ class RunCreate(BaseModel):
     max_year: int = Field(ge=1000, le=3000)
     direction: Direction = "both"
     depth: int = Field(default=1, ge=1, le=3)
+    # Opt-in: drop discovered candidates whose best guiding-topic score falls below the
+    # threshold, so they are neither retained nor expanded. None uses the server default.
+    topic_filter: bool = False
+    topic_filter_threshold: float | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_configuration(self):
